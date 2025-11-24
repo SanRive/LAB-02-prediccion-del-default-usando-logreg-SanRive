@@ -95,3 +95,89 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+
+import gzip
+import json
+import os
+import pickle
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+
+
+# Cargar y limpiar datos
+def load_and_clean(path):
+    df = pd.read_csv(path, compression="zip")
+    df = df.rename(columns={"default payment next month": "default"}).drop(columns=["ID"])
+    df = df[(df["MARRIAGE"] != 0) & (df["EDUCATION"] != 0)].dropna()
+    df["EDUCATION"] = df["EDUCATION"].clip(upper=4)
+    return df
+
+
+train = load_and_clean("files/input/train_data.csv.zip")
+test = load_and_clean("files/input/test_data.csv.zip")
+
+X_train, y_train = train.drop(columns="default"), train["default"]
+X_test, y_test = test.drop(columns="default"), test["default"]
+
+# Pipeline
+cat_features = ["SEX", "EDUCATION", "MARRIAGE"]
+pipeline = Pipeline([
+    ("prep", ColumnTransformer([("cat", OneHotEncoder(), cat_features)], remainder=MinMaxScaler())),
+    ("select", SelectKBest(f_classif)),
+    ("clf", LogisticRegression(max_iter=1000, random_state=42))
+])
+
+# Entrenar
+grid = GridSearchCV(
+    pipeline,
+    {
+        "select__k": range(1, len(X_train.columns) + 1),
+        "clf__C": [0.01, 0.1, 1, 10, 100],
+        "clf__solver": ["liblinear", "lbfgs"]
+    },
+    cv=10,
+    scoring="balanced_accuracy",
+    n_jobs=-1
+)
+grid.fit(X_train, y_train)
+
+# Guardar modelo
+os.makedirs("files/models", exist_ok=True)
+with gzip.open("files/models/model.pkl.gz", "wb") as f:
+    pickle.dump(grid, f)
+
+# Calcular y guardar métricas
+os.makedirs("files/output", exist_ok=True)
+with open("files/output/metrics.json", "w") as f:
+    for X, y, name in [(X_train, y_train, "train"), (X_test, y_test, "test")]:
+        pred = grid.predict(X)
+        
+        # Métricas
+        f.write(json.dumps({
+            "type": "metrics",
+            "dataset": name,
+            "precision": precision_score(y, pred, zero_division=0),
+            "balanced_accuracy": balanced_accuracy_score(y, pred),
+            "recall": recall_score(y, pred, zero_division=0),
+            "f1_score": f1_score(y, pred, zero_division=0)
+        }) + "\n")
+    
+    for X, y, name in [(X_train, y_train, "train"), (X_test, y_test, "test")]:
+        cm = confusion_matrix(y, grid.predict(X))
+        
+        # Matriz de confusión
+        f.write(json.dumps({
+            "type": "cm_matrix",
+            "dataset": name,
+            "true_0": {"predicted_0": int(cm[0, 0]), "predicted_1": int(cm[0, 1])},
+            "true_1": {"predicted_0": int(cm[1, 0]), "predicted_1": int(cm[1, 1])}
+        }) + "\n")
+
+print(f"✓ Best score: {grid.best_score_:.3f} | Params: {grid.best_params_}")
